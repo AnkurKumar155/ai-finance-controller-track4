@@ -1110,6 +1110,10 @@ if run_button:
             st.error(f"Reconciliation failed: {exc}")
 
 
+# Initialize the current result BEFORE any optional hosted demo-data logic.
+# Streamlit Cloud executes the whole script top-to-bottom on each rerun.
+result = st.session_state.get("result")
+
 # ============================================================
 # OPTIONAL BUNDLED DEMO DATA
 # ============================================================
