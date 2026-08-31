@@ -1,0 +1,13 @@
+{
+  "invoice_records": 100,
+  "payment_records": 115,
+  "matched_invoices": 85,
+  "exception_invoices": 15,
+  "unmatched_invoice_records": 0,
+  "unmatched_payments": 15,
+  "match_rate_percent": 85.0,
+  "auto_match_precision_percent": 100.0,
+  "correct_match_coverage_percent": 85.0,
+  "invoice_status_accuracy_percent": 100.0,
+  "ground_truth_basis": "Inferred from the synthetic dataset's intended same-number invoice/payment pairing (INV00001\u2194TXN00001 ... INV00100\u2194TXN00100); not an independently labeled benchmark."
+}
