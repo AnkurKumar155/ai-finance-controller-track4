@@ -1117,29 +1117,58 @@ result = st.session_state.get("result")
 # ============================================================
 # OPTIONAL BUNDLED DEMO DATA
 # ============================================================
-# On hosted deployment, show the app immediately with the bundled synthetic
-# dataset so a reviewer can inspect the controller without uploading files.
-if result is None:
+# On hosted deployment, show the bundled synthetic dataset immediately.
+# Cache the reconciliation result so a new browser/session does NOT rerun the
+# reconciliation engine. This reduces cold-start work and improves reliability
+# on Streamlit Community Cloud.
+@st.cache_data(show_spinner=False, max_entries=1)
+def load_bundled_demo_result():
     demo_invoice_path = os.path.join(BASE_DIR, "sample_data", "invoices.csv")
     demo_payment_path = os.path.join(BASE_DIR, "sample_data", "payments.csv")
-    if os.path.exists(demo_invoice_path) and os.path.exists(demo_payment_path):
-        try:
-            demo_invoices = pd.read_csv(demo_invoice_path)
-            demo_payments = pd.read_csv(demo_payment_path)
-            import time as _time
-            _start = _time.perf_counter()
-            result = run_reconciliation(demo_invoices, demo_payments)
-            st.session_state.reconciliation_seconds = _time.perf_counter() - _start
+
+    if not (
+        os.path.exists(demo_invoice_path)
+        and os.path.exists(demo_payment_path)
+    ):
+        return None
+
+    demo_invoices = pd.read_csv(demo_invoice_path)
+    demo_payments = pd.read_csv(demo_payment_path)
+
+    import time as _time
+    _start = _time.perf_counter()
+    demo_result = run_reconciliation(demo_invoices, demo_payments)
+    demo_seconds = _time.perf_counter() - _start
+
+    return {
+        "result": demo_result,
+        "seconds": demo_seconds,
+        "invoice_count": len(demo_invoices),
+        "payment_count": len(demo_payments),
+    }
+
+
+if result is None:
+    try:
+        cached_demo = load_bundled_demo_result()
+
+        if cached_demo is not None:
+            result = cached_demo["result"]
+            st.session_state.reconciliation_seconds = cached_demo["seconds"]
             st.session_state.result = result
             st.session_state.summary_cache = build_summary(result)
-            st.session_state.audit_log = [{
-                "time": datetime.now().isoformat(timespec="seconds"),
-                "action": "Bundled Demo Dataset Loaded",
-                "details": f"{len(demo_invoices)} invoices; {len(demo_payments)} payments"
-            }]
-        except Exception:
-            # If bundled demo data cannot be loaded, fall back to the normal upload flow.
-            result = None
+
+            if not st.session_state.audit_log:
+                st.session_state.audit_log = [{
+                    "time": datetime.now().isoformat(timespec="seconds"),
+                    "action": "Bundled Demo Dataset Loaded",
+                    "details": (
+                        f"{cached_demo['invoice_count']} invoices; "
+                        f"{cached_demo['payment_count']} payments"
+                    ),
+                }]
+    except Exception:
+        result = st.session_state.get("result")
 
 # ============================================================
 # NO DATA STATE
