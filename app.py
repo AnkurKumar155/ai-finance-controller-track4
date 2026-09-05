@@ -2614,6 +2614,90 @@ Give a short, practical finance-controller answer.
                 else json.dumps(ai_json_safe_dict(record), indent=2, ensure_ascii=False)
             )
 
+            def deterministic_fallback_answer(question_text, analytics_data, record_data, summary_data):
+                """Return a verified controller answer when Mistral is temporarily unavailable."""
+                q_text = question_text.lower().strip()
+
+                # Specific transaction/invoice explanation using verified Python data.
+                if record_data is not None and any(
+                    term in q_text for term in [
+                        "why", "exception", "risk", "status", "amount difference",
+                        "date gap", "explain", "tell me about", "transaction", "invoice",
+                    ]
+                ):
+                    txn = (
+                        safe_str(record_data.get("transaction_id"))
+                        or safe_str(record_data.get("invoice_no"))
+                        or "this record"
+                    )
+                    status_value = safe_str(record_data.get("status")) or "N/A"
+                    risk_value = safe_str(record_data.get("risk")) or "N/A"
+                    reason_value = safe_str(record_data.get("anomaly_reason")) or "None"
+                    confidence_value = record_data.get("confidence")
+                    confidence_text = (
+                        "N/A"
+                        if pd.isna(confidence_value)
+                        else f"{float(confidence_value):.2f}%"
+                    )
+                    difference = fmt_currency(record_data.get("amount_difference"))
+                    date_gap = record_data.get("date_difference")
+                    date_text = (
+                        "N/A"
+                        if pd.isna(date_gap)
+                        else f"{int(abs(float(date_gap)))} days"
+                    )
+                    explanation_value = safe_str(record_data.get("explanation"))
+
+                    parts = [
+                        f"**{txn}** is **{status_value}** with **{risk_value}** risk.",
+                        f"Confidence: **{confidence_text}**.",
+                        f"Amount difference: **{difference}**.",
+                        f"Date gap: **{date_text}**.",
+                        f"Anomaly reason: **{reason_value}**.",
+                    ]
+                    if explanation_value:
+                        parts.append(f"Explanation: {explanation_value}")
+                    if status_value == "EXCEPTION":
+                        parts.append("**Human review is required.**")
+                    return " ".join(parts)
+
+                # Dataset overview for common demo/interview questions.
+                if any(term in q_text for term in [
+                    "dataset", "overall", "summary", "how many records"
+                ]):
+                    return (
+                        f"The dataset contains **{summary_data['total_invoices']:,} invoices** and "
+                        f"**{analytics_data['payments']:,} payments**. There are "
+                        f"**{summary_data['matched']:,} matches**, **{summary_data['exceptions']:,} exceptions**, "
+                        f"and **{analytics_data['unmatched_records']:,} unmatched records**. The match rate is "
+                        f"**{summary_data['match_rate']:.2f}%**."
+                    )
+
+                if any(term in q_text for term in [
+                    "highest payment", "largest payment", "maximum payment"
+                ]):
+                    if "highest_payment" in analytics_data:
+                        return (
+                            f"The highest payment amount is "
+                            f"**{fmt_currency(analytics_data['highest_payment'])}**."
+                        )
+
+                if any(term in q_text for term in ["average payment", "mean payment"]):
+                    if "average_payment" in analytics_data:
+                        return (
+                            f"The average payment amount is "
+                            f"**{fmt_currency(analytics_data['average_payment'])}**."
+                        )
+
+                # Safe generic response using verified controller metrics only.
+                return (
+                    "Mistral is temporarily rate-limited, but the verified controller data is still available. "
+                    f"Current match rate: **{summary_data['match_rate']:.2f}%**; "
+                    f"exceptions: **{summary_data['exceptions']:,}**; "
+                    f"anomalies: **{summary_data['anomalies']:,}**."
+                )
+
+            messages = None
             try:
                 if direct_answer:
                     answer = direct_answer
@@ -2623,14 +2707,38 @@ Give a short, practical finance-controller answer.
                         question=question,
                         analytics=json.dumps(analytics, indent=2, ensure_ascii=False),
                         record=record_text,
-                        history=json.dumps(history_context, indent=2, ensure_ascii=False),
+                        # Keep only the most recent two turns to reduce token usage.
+                        history=json.dumps(history_context[-2:], indent=2, ensure_ascii=False),
                         summary=json.dumps(summary, indent=2, ensure_ascii=False),
                     )
                     response = mistral.invoke(messages)
                     answer = response.content
 
             except Exception as exc:
-                answer = f"Mistral error: {exc}"
+                error_text = str(exc)
+                is_rate_limited = (
+                    "429" in error_text
+                    or "rate limit" in error_text.lower()
+                    or "rate_limited" in error_text.lower()
+                    or "too many requests" in error_text.lower()
+                )
+
+                if is_rate_limited and messages is not None:
+                    # One short retry for transient throttling, then use verified
+                    # deterministic results so the finance workflow still functions.
+                    try:
+                        import time as _time
+                        _time.sleep(1.5)
+                        response = mistral.invoke(messages)
+                        answer = response.content
+                    except Exception:
+                        answer = deterministic_fallback_answer(
+                            question, analytics, record, summary
+                        )
+                else:
+                    answer = deterministic_fallback_answer(
+                        question, analytics, record, summary
+                    )
 
             st.session_state.chat_history.append({
                 "user": question,
