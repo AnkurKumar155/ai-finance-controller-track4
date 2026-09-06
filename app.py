@@ -1245,6 +1245,68 @@ unmatched_payment_value = summary_cache["unmatched_payment_value"]
 total_review_exposure = summary_cache["total_review_exposure"]
 
 
+def evaluate_against_ground_truth(result, ground_truth):
+    """Compare live controller decisions with explicit synthetic labels."""
+    required = {"invoice_no", "expected_status"}
+    if not required.issubset(set(ground_truth.columns)):
+        raise ValueError("Ground truth must contain invoice_no and expected_status.")
+
+    gt = ground_truth.copy()
+    gt["invoice_no"] = gt["invoice_no"].astype(str).str.strip()
+    gt["expected_status"] = gt["expected_status"].astype(str).str.upper().str.strip()
+
+    live = result.copy()
+    live["invoice_no"] = live["invoice_no"].fillna("").astype(str).str.strip()
+    live_invoice = (
+        live[live["invoice_no"] != ""]
+        [["invoice_no", "status", "transaction_id"]]
+        .drop_duplicates("invoice_no")
+    )
+
+    merged = gt.merge(live_invoice, on="invoice_no", how="left")
+    merged["predicted_status"] = merged["status"].fillna("UNMATCH")
+    merged["correct_status"] = merged["expected_status"] == merged["predicted_status"]
+
+    total = len(merged)
+    correct = int(merged["correct_status"].sum())
+    status_accuracy = correct / total * 100 if total else 0.0
+
+    expected_match = merged["expected_status"] == "MATCH"
+    predicted_match = merged["predicted_status"] == "MATCH"
+    tp_match = int((expected_match & predicted_match).sum())
+    predicted_match_count = int(predicted_match.sum())
+    expected_match_count = int(expected_match.sum())
+    match_precision = tp_match / predicted_match_count * 100 if predicted_match_count else 0.0
+    match_coverage = tp_match / expected_match_count * 100 if expected_match_count else 0.0
+
+    expected_review = merged["expected_status"] != "MATCH"
+    predicted_review = merged["predicted_status"] != "MATCH"
+    tp = int((expected_review & predicted_review).sum())
+    fp = int((~expected_review & predicted_review).sum())
+    fn = int((expected_review & ~predicted_review).sum())
+    precision = tp / (tp + fp) * 100 if tp + fp else 0.0
+    recall = tp / (tp + fn) * 100 if tp + fn else 0.0
+    f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
+
+    comparison = merged[[
+        "invoice_no", "expected_status", "predicted_status",
+        "transaction_id", "correct_status"
+    ]].copy()
+
+    return {
+        "status_accuracy_percent": round(status_accuracy, 2),
+        "match_precision_percent": round(match_precision, 2),
+        "match_coverage_percent": round(match_coverage, 2),
+        "review_precision_percent": round(precision, 2),
+        "review_recall_percent": round(recall, 2),
+        "review_f1_percent": round(f1, 2),
+        "total_ground_truth_invoices": total,
+        "correct_status_predictions": correct,
+        "comparison": comparison,
+    }
+
+
+
 # ============================================================
 # DASHBOARD
 # ============================================================
@@ -2614,90 +2676,6 @@ Give a short, practical finance-controller answer.
                 else json.dumps(ai_json_safe_dict(record), indent=2, ensure_ascii=False)
             )
 
-            def deterministic_fallback_answer(question_text, analytics_data, record_data, summary_data):
-                """Return a verified controller answer when Mistral is temporarily unavailable."""
-                q_text = question_text.lower().strip()
-
-                # Specific transaction/invoice explanation using verified Python data.
-                if record_data is not None and any(
-                    term in q_text for term in [
-                        "why", "exception", "risk", "status", "amount difference",
-                        "date gap", "explain", "tell me about", "transaction", "invoice",
-                    ]
-                ):
-                    txn = (
-                        safe_str(record_data.get("transaction_id"))
-                        or safe_str(record_data.get("invoice_no"))
-                        or "this record"
-                    )
-                    status_value = safe_str(record_data.get("status")) or "N/A"
-                    risk_value = safe_str(record_data.get("risk")) or "N/A"
-                    reason_value = safe_str(record_data.get("anomaly_reason")) or "None"
-                    confidence_value = record_data.get("confidence")
-                    confidence_text = (
-                        "N/A"
-                        if pd.isna(confidence_value)
-                        else f"{float(confidence_value):.2f}%"
-                    )
-                    difference = fmt_currency(record_data.get("amount_difference"))
-                    date_gap = record_data.get("date_difference")
-                    date_text = (
-                        "N/A"
-                        if pd.isna(date_gap)
-                        else f"{int(abs(float(date_gap)))} days"
-                    )
-                    explanation_value = safe_str(record_data.get("explanation"))
-
-                    parts = [
-                        f"**{txn}** is **{status_value}** with **{risk_value}** risk.",
-                        f"Confidence: **{confidence_text}**.",
-                        f"Amount difference: **{difference}**.",
-                        f"Date gap: **{date_text}**.",
-                        f"Anomaly reason: **{reason_value}**.",
-                    ]
-                    if explanation_value:
-                        parts.append(f"Explanation: {explanation_value}")
-                    if status_value == "EXCEPTION":
-                        parts.append("**Human review is required.**")
-                    return " ".join(parts)
-
-                # Dataset overview for common demo/interview questions.
-                if any(term in q_text for term in [
-                    "dataset", "overall", "summary", "how many records"
-                ]):
-                    return (
-                        f"The dataset contains **{summary_data['total_invoices']:,} invoices** and "
-                        f"**{analytics_data['payments']:,} payments**. There are "
-                        f"**{summary_data['matched']:,} matches**, **{summary_data['exceptions']:,} exceptions**, "
-                        f"and **{analytics_data['unmatched_records']:,} unmatched records**. The match rate is "
-                        f"**{summary_data['match_rate']:.2f}%**."
-                    )
-
-                if any(term in q_text for term in [
-                    "highest payment", "largest payment", "maximum payment"
-                ]):
-                    if "highest_payment" in analytics_data:
-                        return (
-                            f"The highest payment amount is "
-                            f"**{fmt_currency(analytics_data['highest_payment'])}**."
-                        )
-
-                if any(term in q_text for term in ["average payment", "mean payment"]):
-                    if "average_payment" in analytics_data:
-                        return (
-                            f"The average payment amount is "
-                            f"**{fmt_currency(analytics_data['average_payment'])}**."
-                        )
-
-                # Safe generic response using verified controller metrics only.
-                return (
-                    "Mistral is temporarily rate-limited, but the verified controller data is still available. "
-                    f"Current match rate: **{summary_data['match_rate']:.2f}%**; "
-                    f"exceptions: **{summary_data['exceptions']:,}**; "
-                    f"anomalies: **{summary_data['anomalies']:,}**."
-                )
-
-            messages = None
             try:
                 if direct_answer:
                     answer = direct_answer
@@ -2707,38 +2685,14 @@ Give a short, practical finance-controller answer.
                         question=question,
                         analytics=json.dumps(analytics, indent=2, ensure_ascii=False),
                         record=record_text,
-                        # Keep only the most recent two turns to reduce token usage.
-                        history=json.dumps(history_context[-2:], indent=2, ensure_ascii=False),
+                        history=json.dumps(history_context, indent=2, ensure_ascii=False),
                         summary=json.dumps(summary, indent=2, ensure_ascii=False),
                     )
                     response = mistral.invoke(messages)
                     answer = response.content
 
             except Exception as exc:
-                error_text = str(exc)
-                is_rate_limited = (
-                    "429" in error_text
-                    or "rate limit" in error_text.lower()
-                    or "rate_limited" in error_text.lower()
-                    or "too many requests" in error_text.lower()
-                )
-
-                if is_rate_limited and messages is not None:
-                    # One short retry for transient throttling, then use verified
-                    # deterministic results so the finance workflow still functions.
-                    try:
-                        import time as _time
-                        _time.sleep(1.5)
-                        response = mistral.invoke(messages)
-                        answer = response.content
-                    except Exception:
-                        answer = deterministic_fallback_answer(
-                            question, analytics, record, summary
-                        )
-                else:
-                    answer = deterministic_fallback_answer(
-                        question, analytics, record, summary
-                    )
+                answer = f"Mistral error: {exc}"
 
             st.session_state.chat_history.append({
                 "user": question,
@@ -2850,75 +2804,57 @@ elif page == "🧪 Evaluation":
     else:
         st.success("All records were matched safely.")
 
-    st.warning(
-        "Independent accuracy is not claimed here. To report true accuracy, compare the controller's decisions against a separately verified ground-truth dataset."
-    )
-
     # ------------------------------------------------------------
-    # VERIFIED SYNTHETIC GROUND-TRUTH RESULTS
+    # EXPLICIT SYNTHETIC GROUND-TRUTH EVALUATION
     # ------------------------------------------------------------
-    # In Colab, upload these files to /content:
-    #   track4_ground_truth_metrics.json
-    #   track4_ground_truth_evaluation.csv
-    #
-    # The metrics are explicitly labeled as inferred synthetic ground truth.
-    verified_metrics_path = os.path.join(BASE_DIR, "sample_data", "track4_ground_truth_metrics.json")
-    verified_csv_path = os.path.join(BASE_DIR, "sample_data", "track4_ground_truth_evaluation.csv")
+    ground_truth_path = os.path.join(BASE_DIR, "sample_data", "ground_truth.csv")
 
-    if os.path.exists(verified_metrics_path):
+    if os.path.exists(ground_truth_path):
         try:
-            with open(verified_metrics_path, "r", encoding="utf-8") as f:
-                verified_metrics = json.load(f)
+            ground_truth = pd.read_csv(ground_truth_path)
+            gt_eval = evaluate_against_ground_truth(result, ground_truth)
 
-            st.markdown("### ✅ Verified Synthetic Ground-Truth Results")
+            st.markdown("### ✅ Measured Accuracy")
             st.caption(
-                "These values come from the separately generated evaluation files. "
-                "The ground truth is inferred from the synthetic dataset's intended "
-                "invoice/payment pairing and is not an independently labeled benchmark."
+                "Measured against explicit labels in the bundled synthetic test set. "
+                "This is a demo evaluation, not an independent production benchmark."
             )
 
-            v1, v2, v3, v4 = st.columns(4)
-            v1.metric(
-                "Auto-match Precision",
-                f"{verified_metrics.get('auto_match_precision_percent', 0):.2f}%"
+            a1, a2, a3, a4 = st.columns(4)
+            a1.metric("Status Accuracy", f"{gt_eval['status_accuracy_percent']:.2f}%")
+            a2.metric("MATCH Precision", f"{gt_eval['match_precision_percent']:.2f}%")
+            a3.metric("MATCH Coverage", f"{gt_eval['match_coverage_percent']:.2f}%")
+            a4.metric("Review F1", f"{gt_eval['review_f1_percent']:.2f}%")
+
+            st.write(
+                f"Correct status decisions: {gt_eval['correct_status_predictions']:,} "
+                f"of {gt_eval['total_ground_truth_invoices']:,} invoices."
             )
-            v2.metric(
-                "Correct-match Coverage",
-                f"{verified_metrics.get('correct_match_coverage_percent', 0):.2f}%"
-            )
-            v3.metric(
-                "Status Accuracy",
-                f"{verified_metrics.get('invoice_status_accuracy_percent', 0):.2f}%"
-            )
-            v4.metric(
-                "Verified Exceptions",
-                f"{verified_metrics.get('exception_invoices', 0):,}"
+            st.write(
+                f"Review detection — Precision: {gt_eval['review_precision_percent']:.2f}% | "
+                f"Recall: {gt_eval['review_recall_percent']:.2f}% | "
+                f"F1: {gt_eval['review_f1_percent']:.2f}%"
             )
 
-            basis = verified_metrics.get("ground_truth_basis")
-            if basis:
-                st.info(f"**Verification basis:** {basis}")
+            mismatches = gt_eval["comparison"][~gt_eval["comparison"]["correct_status"]]
+            if len(mismatches):
+                st.markdown("### ⚠️ Evaluation Mismatches")
+                st.dataframe(mismatches, use_container_width=True, hide_index=True)
+            else:
+                st.success("All ground-truth invoice statuses were predicted correctly.")
 
-            if os.path.exists(verified_csv_path):
-                with open(verified_csv_path, "rb") as f:
-                    csv_bytes = f.read()
-                st.download_button(
-                    "⬇️ Download Ground-Truth Evaluation CSV",
-                    data=csv_bytes,
-                    file_name="track4_ground_truth_evaluation.csv",
-                    mime="text/csv",
-                    use_container_width=True,
-                )
-        except Exception:
-            # Never show a red application error on the judging/demo page.
-            st.info(
-                "Verified metrics are optional. The main Track 04 evaluation "
-                "continues to use the live reconciliation results above."
+            st.download_button(
+                "⬇️ Download Ground-Truth Comparison CSV",
+                data=gt_eval["comparison"].to_csv(index=False).encode("utf-8"),
+                file_name="track4_ground_truth_comparison.csv",
+                mime="text/csv",
+                use_container_width=True,
             )
+        except Exception as exc:
+            st.error(f"Ground-truth evaluation failed: {exc}")
     else:
-        st.info(
-            "Upload the verified ground-truth files to /content to show the "
-            "additional verification metrics."
+        st.warning(
+            "No ground_truth.csv found. Add a labelled test set before claiming measured accuracy."
         )
 
 
